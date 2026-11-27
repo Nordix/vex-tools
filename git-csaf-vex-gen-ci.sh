@@ -52,6 +52,7 @@ PER_CVE=false
 
 readonly PUBLISHER_NAME="EST"
 readonly PUBLISHER_NS="https://github.com/Nordix"
+readonly CVE_REGEX='CVE-[0-9]{4}-[0-9]{4,}'
 # Release tags: <upstream tag>-est-<number>, digits only (v1.7.3-est-1, not -est or -est1)
 readonly EST_TAG_REGEX='^.+-est-[0-9]+$'
 
@@ -103,6 +104,8 @@ cd "$REPO_PATH"
 
 # Derive the GitHub org/repo slug from origin (used for gh api calls)
 REPO_SLUG=$(git remote get-url origin | sed 's|.*github\.com[:/]||; s|\.git$||')
+[[ "$REPO_SLUG" =~ ^[^/]+/[^/]+$ ]] \
+  || { echo "Error: could not derive a GitHub owner/repo from the origin URL (got '$REPO_SLUG')" >&2; exit 1; }
 
 # Scratch space for temp files; removed on exit.
 WORK_DIR=$(mktemp -d)
@@ -141,7 +144,7 @@ if [ -z "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
     echo "Auto-detected release tag: $EST_RELEASE_TAG"
   else
     # Last resort: scan commits by @est.tech authors
-    first_est=$(git log --author="@est.tech" --format="%H" --reverse | head -1)
+    first_est=$(git log --author="@est.tech" --format="%H" --reverse | head -1 || true)
     if [ -n "$first_est" ]; then
       echo "No -est tag found, scanning from first @est.tech commit"
       SINCE_REF="$first_est"
@@ -169,15 +172,11 @@ if [ -n "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
   echo "Computed upstream base tag: $UPSTREAM_BASE_TAG"
 
   # Fetch from upstream if not available locally
-  if ! git rev-parse "refs/tags/${UPSTREAM_BASE_TAG}" >/dev/null 2>&1; then
+  if ! git rev-parse --verify --quiet "refs/tags/${UPSTREAM_BASE_TAG}" >/dev/null; then
     echo "Base tag $UPSTREAM_BASE_TAG not found locally, attempting to fetch from upstream..."
 
     if [ -z "$UPSTREAM_URL" ]; then
-
-      if command -v gh >/dev/null 2>&1; then
-        UPSTREAM_URL=$(gh api "repos/${REPO_SLUG}" --jq '.parent.clone_url' 2>/dev/null || true)
-      fi
-
+      UPSTREAM_URL=$(gh api "repos/${REPO_SLUG}" --jq '.parent.clone_url // empty' 2>/dev/null || true)
       if [ -n "$UPSTREAM_URL" ]; then
         echo "Auto-detected upstream: $UPSTREAM_URL"
       else
@@ -194,7 +193,7 @@ if [ -n "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
     fi
   fi
 
-  if git rev-parse "refs/tags/${UPSTREAM_BASE_TAG}" >/dev/null 2>&1; then
+  if git rev-parse --verify --quiet "refs/tags/${UPSTREAM_BASE_TAG}" >/dev/null; then
     SINCE_REF="$UPSTREAM_BASE_TAG"
     echo "Using base tag as since-ref: $SINCE_REF"
   else
@@ -274,7 +273,7 @@ while IFS= read -r -d '' line; do
   [ -n "$line" ] || continue
   commit_hash="${line%% *}"
   rest="${line#* }"
-  cve_matches=$(echo "$rest" | grep -oE 'CVE-[0-9]{4}-[0-9]{4,}' || true)
+  cve_matches=$(echo "$rest" | grep -oE "$CVE_REGEX" || true)
   for cve in $cve_matches; do
     commit_msg=$(echo "$rest" | head -1)
     record_cve "$cve" "${commit_hash:0:12}" \
@@ -320,7 +319,7 @@ else
     # Skip PRs whose merge commit is not part of this release range
     [ -n "${RANGE_SHAS[${pr_sha:-}]:-}" ] || continue
 
-    pr_cves=$(echo "$pr_text" | grep -oE 'CVE-[0-9]{4}-[0-9]{4,}' || true)
+    pr_cves=$(echo "$pr_text" | grep -oE "$CVE_REGEX" || true)
     for cve in $pr_cves; do
       record_cve "$cve" "pr:${pr_num}" \
         "Fixed via PR #${pr_num} (commit ${pr_sha:0:12}): ${pr_title}" \
@@ -351,7 +350,7 @@ if [ -n "$TAGS_IN_RANGE" ]; then
     fi
     [ -n "$release_body" ] || continue
 
-    release_cves=$(echo "$release_body" | grep -oE 'CVE-[0-9]{4}-[0-9]{4,}' || true)
+    release_cves=$(echo "$release_body" | grep -oE "$CVE_REGEX" || true)
     for cve in $release_cves; do
       record_cve "$cve" "release:$tag" \
         "Referenced in release ${tag}" \
