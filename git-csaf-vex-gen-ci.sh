@@ -94,6 +94,12 @@ cd "$REPO_PATH"
 # Derive the GitHub org/repo slug from origin (used for gh api calls)
 REPO_SLUG=$(git remote get-url origin | sed 's|.*github\.com[:/]||; s|\.git$||')
 
+# Scratch space for temp files; removed on exit.
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
+CVE_ENTRIES_FILE="$WORK_DIR/cve-entries.ndjson"
+: > "$CVE_ENTRIES_FILE"
+
 # ─── Auto-detect release tag if not provided ────────────────────────────────
 
 if [ -z "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
@@ -181,6 +187,9 @@ VENDOR_NAME="$PUBLISHER_NAME"
 
 # ─── Helper: record CVE ────────────────────────────────────────────────────
 
+# CVE -> first source that reported it (earliest source wins)
+declare -A CVE_MAP=()
+
 record_cve() {
   local cve="$1" source="$2" note="$3" remediation="$4"
 
@@ -226,11 +235,7 @@ fi
 echo "Scanning commits ${SINCE_REF:-first EST commit}..${UPPER_REF}"
 
 # Single-pass: extract all CVE mentions with their commit hash and message
-# Output: one JSON object per CVE (earliest commit wins due to --reverse)
-declare -A CVE_MAP=()
-CVE_ENTRIES_FILE=$(mktemp)
-trap 'rm -f "$CVE_ENTRIES_FILE"' EXIT
-
+# (earliest commit wins due to --reverse)
 while IFS= read -r -d '' line; do
   # git log emits "\0\n" between records, so every record after the first
   # arrives with a leading newline. Strip leading whitespace before parsing.
