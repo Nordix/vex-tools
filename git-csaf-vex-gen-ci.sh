@@ -1,11 +1,22 @@
 #!/bin/bash
 # git-csaf-vex-gen-ci.sh — generate CSAF VEX documents from fork git history
 #
-# Designed for Nordix forks where release tags follow the pattern:
-#   v1.7.3-est-1, camel-3.14.10-est-1, kustomize/v1.24.0-est1
+# Designed for Nordix forks where release tags follow the pattern
+# <upstream tag>-est-<number> (the number is digits only), e.g.:
+#   v1.7.3-est-1, camel-3.14.10-est-1, kustomize/v1.24.0-est-2
+# Tags such as v1.7.3-est or v1.7.3-est1 are NOT valid release tags.
 #
 # The script auto-resolves the upstream base tag from the release tag,
 # fetches it from the upstream repo, and uses it as the scan starting point.
+# CVE references are collected from three sources inside the window
+# <upstream base tag> .. <release tag>:
+#   1. commit messages (local git)
+#   2. merged pull request titles and bodies (GitHub API)
+#   3. GitHub release descriptions for tags in the window (GitHub API)
+#
+# The GitHub-backed scans (2 and 3) FAIL LOUDLY: if GitHub cannot be reached,
+# the token is invalid, or the token lacks pull request read access, the script
+# exits non-zero instead of silently producing an incomplete VEX.
 #
 # Only requires: git, jq, gh, date (coreutils)
 #
@@ -14,12 +25,18 @@
 #   product-purl:    PURL for the product (default: auto-detected as pkg:generic/<repo-name>@<latest-tag>)
 #
 # Options:
-#   --release-tag TAG      the fork release tag (e.g. v1.7.3-est-1); auto-computes
-#                          base tag by stripping -est[N] suffix and fetches from upstream
+#   --release-tag TAG      the fork release tag, <upstream tag>-est-<number> (e.g. v1.7.3-est-1);
+#                          auto-computes the base tag by stripping -est-<number> and fetches
+#                          it from upstream.
+#                          Also the UPPER bound of the scan, so the VEX reflects exactly
+#                          what shipped in that release, not whatever HEAD points to.
 #   --since-ref REF        tag/commit to scan from (overrides --release-tag auto-detection)
 #   --output-dir DIR       where to write VEX files (default: vex-output)
 #   --upstream-url URL     upstream repo URL for fetching base tags (auto-detected if omitted)
 #   --per-cve              also emit individual per-CVE CSAF VEX files
+#
+# Authentication: gh must be authenticated (GH_TOKEN or `gh auth login`). In
+# GitHub Actions the token needs `contents: read` and `pull-requests: read`.
 
 set -euo pipefail
 
@@ -35,15 +52,22 @@ PER_CVE=false
 
 readonly PUBLISHER_NAME="EST"
 readonly PUBLISHER_NS="https://github.com/Nordix"
+readonly CVE_REGEX='CVE-[0-9]{4}-[0-9]{4,}'
+# Release tags: <upstream tag>-est-<number>, digits only (v1.7.3-est-1, not -est or -est1)
+readonly EST_TAG_REGEX='^.+-est-[0-9]+$'
 
 # ─── Parse arguments ────────────────────────────────────────────────────────
 
+require_value() {
+  [ "$#" -ge 2 ] && [ -n "${2:-}" ] || { echo "Error: option $1 requires a value" >&2; exit 1; }
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --output-dir)    OUTPUT_DIR="$2"; shift 2 ;;
-    --since-ref)     SINCE_REF="$2"; shift 2 ;;
-    --release-tag)   EST_RELEASE_TAG="$2"; shift 2 ;;
-    --upstream-url)  UPSTREAM_URL="$2"; shift 2 ;;
+    --output-dir)    require_value "$@"; OUTPUT_DIR="$2"; shift 2 ;;
+    --since-ref)     require_value "$@"; SINCE_REF="$2"; shift 2 ;;
+    --release-tag)   require_value "$@"; EST_RELEASE_TAG="$2"; shift 2 ;;
+    --upstream-url)  require_value "$@"; UPSTREAM_URL="$2"; shift 2 ;;
     --per-cve)       PER_CVE=true; shift ;;
     -*)              echo "Unknown option: $1" >&2; exit 1 ;;
     *)
@@ -66,27 +90,61 @@ command -v jq >/dev/null 2>&1 || { echo "Error: jq not found in PATH" >&2; exit 
 command -v git >/dev/null 2>&1 || { echo "Error: git not found in PATH" >&2; exit 1; }
 command -v gh >/dev/null 2>&1 || { echo "Error: gh not found in PATH" >&2; exit 1; }
 
-if ! git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1; then
-  echo "Error: $REPO_PATH is not a git repository" >&2
+# A supplied release tag must be <upstream tag>-est-<number>. Checked before any
+# GitHub call so a malformed tag fails fast.
+if [ -n "$EST_RELEASE_TAG" ] && ! [[ "$EST_RELEASE_TAG" =~ $EST_TAG_REGEX ]]; then
+  echo "Error: release tag '$EST_RELEASE_TAG' is not valid; expected <upstream tag>-est-<number> (e.g. v1.7.3-est-1)" >&2
   exit 1
 fi
+
+git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1 \
+  || { echo "Error: $REPO_PATH is not a git repository" >&2; exit 1; }
 
 cd "$REPO_PATH"
 
 # Derive the GitHub org/repo slug from origin (used for gh api calls)
 REPO_SLUG=$(git remote get-url origin | sed 's|.*github\.com[:/]||; s|\.git$||')
+[[ "$REPO_SLUG" =~ ^[^/]+/[^/]+$ ]] \
+  || { echo "Error: could not derive a GitHub owner/repo from the origin URL (got '$REPO_SLUG')" >&2; exit 1; }
+
+# Scratch space for temp files; removed on exit.
+WORK_DIR=$(mktemp -d)
+trap 'rm -rf "$WORK_DIR"' EXIT
+CVE_ENTRIES_FILE="$WORK_DIR/cve-entries.ndjson"
+PR_TSV="$WORK_DIR/prs.tsv"
+GH_ERR="$WORK_DIR/gh.err"
+: > "$CVE_ENTRIES_FILE"
+
+# ─── GitHub access preflight ────────────────────────────────────────────────
+# The PR and release scans depend on GitHub. Verify access BEFORE scanning so a
+# bad token or missing permission aborts the run instead of silently yielding a
+# VEX built from commit messages only.
+
+if ! gh api "repos/${REPO_SLUG}" --jq '.full_name' >/dev/null 2>"$GH_ERR"; then
+  echo "Error: cannot access GitHub repo ${REPO_SLUG} with gh:" >&2
+  sed 's/^/  /' "$GH_ERR" >&2
+  echo "Error: gh is not authenticated or lacks access; set GH_TOKEN or run 'gh auth login'" >&2
+  exit 1
+fi
+
+if ! gh api "repos/${REPO_SLUG}/pulls?state=closed&per_page=1" >/dev/null 2>"$GH_ERR"; then
+  echo "Error: cannot list pull requests for ${REPO_SLUG}:" >&2
+  sed 's/^/  /' "$GH_ERR" >&2
+  echo "Error: token lacks pull request read access (in Actions add 'pull-requests: read')" >&2
+  exit 1
+fi
 
 # ─── Auto-detect release tag if not provided ────────────────────────────────
 
 if [ -z "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
-  # Find the latest -est tag in the repo (exclude api/ prefixed Go module tags).
-  # Matches any -est marker regardless of what follows: -est, -est1, -est-1, -est.rc2 ...
-  EST_RELEASE_TAG=$(git tag --sort=-creatordate | grep -v '^api/' | grep -E -- '-est' | head -1 || true)
+  # Find the latest release tag (exclude api/ prefixed Go module tags). Only tags
+  # of the form <upstream tag>-est-<number> qualify; -est and -est1 are ignored.
+  EST_RELEASE_TAG=$(git tag --sort=-creatordate | grep -v '^api/' | grep -E -- "$EST_TAG_REGEX" | head -1 || true)
   if [ -n "$EST_RELEASE_TAG" ]; then
     echo "Auto-detected release tag: $EST_RELEASE_TAG"
   else
     # Last resort: scan commits by @est.tech authors
-    first_est=$(git log --author="@est.tech" --format="%H" --reverse | head -1)
+    first_est=$(git log --author="@est.tech" --format="%H" --reverse | head -1 || true)
     if [ -n "$first_est" ]; then
       echo "No -est tag found, scanning from first @est.tech commit"
       SINCE_REF="$first_est"
@@ -97,26 +155,28 @@ if [ -z "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
   fi
 fi
 
+# The release tag must exist, otherwise the scan range is meaningless.
+if [ -n "$EST_RELEASE_TAG" ]; then
+  git rev-parse --verify --quiet "refs/tags/${EST_RELEASE_TAG}^{commit}" >/dev/null \
+    || { echo "Error: release tag '$EST_RELEASE_TAG' not found in this repository (is the checkout shallow? use fetch-depth: 0)" >&2; exit 1; }
+fi
+
 # ─── Upstream base tag resolution ───────────────────────────────────────────
 
 if [ -n "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
-  # Strip the -est marker and everything after it, whatever form it takes.
-  # The leading (.*) anchors on the last -est, so tags whose name part
-  # also contains "-est" strip correctly.
-  UPSTREAM_BASE_TAG=$(echo "$EST_RELEASE_TAG" | sed -E 's/(.*)-est.*$/\1/')
+  # Strip the trailing -est-<number>. The tag was validated against EST_TAG_REGEX,
+  # so everything after the last "-est-" is digits and the shortest "-est-*"
+  # suffix is exactly that marker (names containing "-est-" earlier are kept).
+  UPSTREAM_BASE_TAG="${EST_RELEASE_TAG%-est-*}"
   echo "EST release tag: $EST_RELEASE_TAG"
   echo "Computed upstream base tag: $UPSTREAM_BASE_TAG"
 
   # Fetch from upstream if not available locally
-  if ! git rev-parse "refs/tags/${UPSTREAM_BASE_TAG}" >/dev/null 2>&1; then
+  if ! git rev-parse --verify --quiet "refs/tags/${UPSTREAM_BASE_TAG}" >/dev/null; then
     echo "Base tag $UPSTREAM_BASE_TAG not found locally, attempting to fetch from upstream..."
 
     if [ -z "$UPSTREAM_URL" ]; then
-
-      if command -v gh >/dev/null 2>&1; then
-        UPSTREAM_URL=$(gh api "repos/${REPO_SLUG}" --jq '.parent.clone_url' 2>/dev/null || true)
-      fi
-
+      UPSTREAM_URL=$(gh api "repos/${REPO_SLUG}" --jq '.parent.clone_url // empty' 2>/dev/null || true)
       if [ -n "$UPSTREAM_URL" ]; then
         echo "Auto-detected upstream: $UPSTREAM_URL"
       else
@@ -133,7 +193,7 @@ if [ -n "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
     fi
   fi
 
-  if git rev-parse "refs/tags/${UPSTREAM_BASE_TAG}" >/dev/null 2>&1; then
+  if git rev-parse --verify --quiet "refs/tags/${UPSTREAM_BASE_TAG}" >/dev/null; then
     SINCE_REF="$UPSTREAM_BASE_TAG"
     echo "Using base tag as since-ref: $SINCE_REF"
   else
@@ -156,6 +216,9 @@ fi
 VENDOR_NAME="$PUBLISHER_NAME"
 
 # ─── Helper: record CVE ────────────────────────────────────────────────────
+
+# CVE -> first source that reported it (earliest source wins)
+declare -A CVE_MAP=()
 
 record_cve() {
   local cve="$1" source="$2" note="$3" remediation="$4"
@@ -180,18 +243,29 @@ record_cve() {
   echo "   $cve ($source)"
 }
 
-# ─── Determine commit range and extract CVE-to-commit mapping ──────────────
+# ─── Determine commit range ────────────────────────────────────────────────
 
-LOG_RANGE="${SINCE_REF}^..HEAD"
+# Bound the scan on the release tag when one is known, so the VEX reflects
+# exactly what shipped in that release rather than whatever HEAD points to.
+# Falls back to HEAD only when scanning from a bare --since-ref with no tag.
+UPPER_REF="${EST_RELEASE_TAG:-HEAD}"
 
-echo "Scanning commits since ${SINCE_REF:-first EST commit}"
+# Normally we scan SINCE_REF^..UPPER_REF so the SINCE_REF commit itself is
+# included. If SINCE_REF is a root commit it has no parent, so "SINCE_REF^" is
+# invalid and would abort the script under `set -e`. Fall back to the full
+# UPPER_REF history in that case (which still includes the root commit).
+if git rev-parse --verify --quiet "${SINCE_REF}^" >/dev/null 2>&1; then
+  LOG_RANGE="${SINCE_REF}^..${UPPER_REF}"
+else
+  LOG_RANGE="$UPPER_REF"
+fi
+
+# ─── Scan commit messages for CVEs ─────────────────────────────────────────
+
+echo "Scanning commits ${SINCE_REF:-first EST commit}..${UPPER_REF}"
 
 # Single-pass: extract all CVE mentions with their commit hash and message
-# Output: one JSON object per CVE (earliest commit wins due to --reverse)
-declare -A CVE_MAP=()
-CVE_ENTRIES_FILE=$(mktemp)
-trap 'rm -f "$CVE_ENTRIES_FILE"' EXIT
-
+# (earliest commit wins due to --reverse)
 while IFS= read -r -d '' line; do
   # git log emits "\0\n" between records, so every record after the first
   # arrives with a leading newline. Strip leading whitespace before parsing.
@@ -199,7 +273,7 @@ while IFS= read -r -d '' line; do
   [ -n "$line" ] || continue
   commit_hash="${line%% *}"
   rest="${line#* }"
-  cve_matches=$(echo "$rest" | grep -oE 'CVE-[0-9]{4}-[0-9]{4,}' || true)
+  cve_matches=$(echo "$rest" | grep -oE "$CVE_REGEX" || true)
   for cve in $cve_matches; do
     commit_msg=$(echo "$rest" | head -1)
     record_cve "$cve" "${commit_hash:0:12}" \
@@ -210,53 +284,73 @@ done < <(git log "$LOG_RANGE" --reverse --format="%H %s %b%x00")
 
 # ─── Scan pull requests for CVEs ───────────────────────────────────────────
 
-echo "Scanning merged pull requests between ${SINCE_REF} and HEAD..."
+echo "Scanning merged pull requests between ${SINCE_REF} and ${UPPER_REF}..."
 
 # Set of commits in range, used to decide whether a PR landed in this release.
 declare -A RANGE_SHAS=()
 while IFS= read -r sha; do
   [ -n "$sha" ] && RANGE_SHAS["$sha"]=1
-done < <(git rev-list "$LOG_RANGE" 2>/dev/null || true)
+done < <(git rev-list "$LOG_RANGE")
 
-if [ "${#RANGE_SHAS[@]}" -gt 0 ]; then
-  # Only merged PRs: an open or closed-unmerged PR still exposes a
-  # merge_commit_sha, and treating one as "fixed" would be a false VEX claim.
+if [ "${#RANGE_SHAS[@]}" -eq 0 ]; then
+  echo "Warning: no commits in range $LOG_RANGE; skipping PR scan" >&2
+else
+  # Fetch every closed PR. Any failure aborts: a partial or empty PR list would
+  # silently under-report CVEs.
+  if ! gh api --paginate "repos/${REPO_SLUG}/pulls?state=closed&per_page=100" \
+      --jq '.[]
+            | select(.merged_at != null)
+            | [ (.number|tostring),
+                (.merge_commit_sha // ""),
+                (.title | gsub("[\n\r\t]"; " ")),
+                ((.title + " " + (.body // "")) | gsub("[\n\r\t]"; " ")) ]
+            | @tsv' > "$PR_TSV" 2>"$GH_ERR"; then
+    echo "Error: failed to list pull requests for ${REPO_SLUG}:" >&2
+    sed 's/^/  /' "$GH_ERR" >&2
+    echo "Error: PR scan could not complete; refusing to write an incomplete VEX" >&2
+    exit 1
+  fi
+
+  # Only merged PRs (filtered above): an open or closed-unmerged PR still
+  # exposes a merge_commit_sha, and treating one as "fixed" would be a false
+  # VEX claim.
   while IFS=$'\t' read -r pr_num pr_sha pr_title pr_text; do
     [ -n "${pr_num:-}" ] || continue
     # Skip PRs whose merge commit is not part of this release range
     [ -n "${RANGE_SHAS[${pr_sha:-}]:-}" ] || continue
 
-    pr_cves=$(echo "$pr_text" | grep -oE 'CVE-[0-9]{4}-[0-9]{4,}' || true)
+    pr_cves=$(echo "$pr_text" | grep -oE "$CVE_REGEX" || true)
     for cve in $pr_cves; do
       record_cve "$cve" "pr:${pr_num}" \
         "Fixed via PR #${pr_num} (commit ${pr_sha:0:12}): ${pr_title}" \
         "Update to ${PRODUCT_NAME} ${PRODUCT_VERSION} or later (fork PR #${pr_num}, commit ${pr_sha:0:12})"
     done
-  done < <(gh api --paginate "repos/${REPO_SLUG}/pulls?state=closed&per_page=100" \
-    --jq '.[]
-          | select(.merged_at != null)
-          | [ (.number|tostring),
-              (.merge_commit_sha // ""),
-              (.title | gsub("[\n\r\t]"; " ")),
-              ((.title + " " + (.body // "")) | gsub("[\n\r\t]"; " ")) ]
-          | @tsv' 2>/dev/null || true)
+  done < "$PR_TSV"
 fi
 
 # ─── Scan release descriptions for CVEs ────────────────────────────────────
 
-echo "Scanning release descriptions between ${SINCE_REF} and HEAD..."
+echo "Scanning release descriptions between ${SINCE_REF} and ${UPPER_REF}..."
 
-# Get all tags reachable from HEAD but not from SINCE_REF (i.e., tags in our range)
-TAGS_IN_RANGE=$(git tag --merged HEAD --no-merged "$SINCE_REF" 2>/dev/null || true)
+# Tags reachable from UPPER_REF but not from SINCE_REF (tags in our range)
+TAGS_IN_RANGE=$(git tag --merged "$UPPER_REF" --no-merged "$SINCE_REF")
 
 if [ -n "$TAGS_IN_RANGE" ]; then
   while IFS= read -r tag; do
-    release_body=$(gh api "repos/${REPO_SLUG}/releases/tags/${tag}" --jq '.body // empty' 2>/dev/null || true)
-    if [ -z "$release_body" ]; then
+    if release_body=$(gh api "repos/${REPO_SLUG}/releases/tags/${tag}" --jq '.body // empty' 2>"$GH_ERR"); then
+      :
+    elif grep -qiE 'HTTP 404|Not Found' "$GH_ERR"; then
+      # A tag without a GitHub release is normal; nothing to scan.
       continue
+    else
+      echo "Error: failed to read release for tag ${tag}:" >&2
+      sed 's/^/  /' "$GH_ERR" >&2
+      echo "Error: release scan could not complete; refusing to write an incomplete VEX" >&2
+      exit 1
     fi
+    [ -n "$release_body" ] || continue
 
-    release_cves=$(echo "$release_body" | grep -oE 'CVE-[0-9]{4}-[0-9]{4,}' || true)
+    release_cves=$(echo "$release_body" | grep -oE "$CVE_REGEX" || true)
     for cve in $release_cves; do
       record_cve "$cve" "release:$tag" \
         "Referenced in release ${tag}" \
@@ -268,8 +362,8 @@ fi
 cve_count="${#CVE_MAP[@]}"
 
 if [ "$cve_count" -eq 0 ]; then
-  echo "No CVE references found in git history"
-  exit 1
+  echo "No CVE references found in commits, pull requests or releases" >&2
+  exit 0
 fi
 
 echo "Found $cve_count CVEs"
