@@ -57,12 +57,16 @@ readonly EST_TAG_REGEX='^.+-est-[0-9]+$'
 
 # ─── Parse arguments ────────────────────────────────────────────────────────
 
+require_value() {
+  [ "$#" -ge 2 ] && [ -n "${2:-}" ] || { echo "Error: option $1 requires a value" >&2; exit 1; }
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --output-dir)    OUTPUT_DIR="$2"; shift 2 ;;
-    --since-ref)     SINCE_REF="$2"; shift 2 ;;
-    --release-tag)   EST_RELEASE_TAG="$2"; shift 2 ;;
-    --upstream-url)  UPSTREAM_URL="$2"; shift 2 ;;
+    --output-dir)    require_value "$@"; OUTPUT_DIR="$2"; shift 2 ;;
+    --since-ref)     require_value "$@"; SINCE_REF="$2"; shift 2 ;;
+    --release-tag)   require_value "$@"; EST_RELEASE_TAG="$2"; shift 2 ;;
+    --upstream-url)  require_value "$@"; UPSTREAM_URL="$2"; shift 2 ;;
     --per-cve)       PER_CVE=true; shift ;;
     -*)              echo "Unknown option: $1" >&2; exit 1 ;;
     *)
