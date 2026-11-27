@@ -8,6 +8,12 @@
 #
 # The script auto-resolves the upstream base tag from the release tag,
 # fetches it from the upstream repo, and uses it as the scan starting point.
+# CVE references are collected from three sources inside the window
+# <upstream base tag> .. <release tag>:
+#   1. commit messages (local git)
+#   2. merged pull request titles and bodies (GitHub API)
+#   3. GitHub release descriptions for tags in the window (GitHub API)
+#
 #
 # Only requires: git, jq, gh, date (coreutils)
 #
@@ -19,6 +25,8 @@
 #   --release-tag TAG      the fork release tag, <upstream tag>-est-<number> (e.g. v1.7.3-est-1);
 #                          auto-computes the base tag by stripping -est-<number> and fetches
 #                          it from upstream.
+#                          Also the UPPER bound of the scan, so the VEX reflects exactly
+#                          what shipped in that release, not whatever HEAD points to.
 #   --since-ref REF        tag/commit to scan from (overrides --release-tag auto-detection)
 #   --output-dir DIR       where to write VEX files (default: vex-output)
 #   --upstream-url URL     upstream repo URL for fetching base tags (auto-detected if omitted)
@@ -107,6 +115,12 @@ if [ -z "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
   fi
 fi
 
+# The release tag must exist, otherwise the scan range is meaningless.
+if [ -n "$EST_RELEASE_TAG" ]; then
+  git rev-parse --verify --quiet "refs/tags/${EST_RELEASE_TAG}^{commit}" >/dev/null \
+    || { echo "Error: release tag '$EST_RELEASE_TAG' not found in this repository (is the checkout shallow? use fetch-depth: 0)" >&2; exit 1; }
+fi
+
 # ─── Upstream base tag resolution ───────────────────────────────────────────
 
 if [ -n "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
@@ -190,11 +204,17 @@ record_cve() {
   echo "   $cve ($source)"
 }
 
-# ─── Determine commit range and extract CVE-to-commit mapping ──────────────
+# ─── Determine commit range ────────────────────────────────────────────────
 
-LOG_RANGE="${SINCE_REF}^..HEAD"
+# Bound the scan on the release tag when one is known, so the VEX reflects
+# exactly what shipped in that release rather than whatever HEAD points to.
+# Falls back to HEAD only when scanning from a bare --since-ref with no tag.
+UPPER_REF="${EST_RELEASE_TAG:-HEAD}"
+LOG_RANGE="${SINCE_REF}^..${UPPER_REF}"
 
-echo "Scanning commits since ${SINCE_REF:-first EST commit}"
+# ─── Scan commit messages for CVEs ─────────────────────────────────────────
+
+echo "Scanning commits ${SINCE_REF:-first EST commit}..${UPPER_REF}"
 
 # Single-pass: extract all CVE mentions with their commit hash and message
 # Output: one JSON object per CVE (earliest commit wins due to --reverse)
@@ -220,7 +240,7 @@ done < <(git log "$LOG_RANGE" --reverse --format="%H %s %b%x00")
 
 # ─── Scan pull requests for CVEs ───────────────────────────────────────────
 
-echo "Scanning merged pull requests between ${SINCE_REF} and HEAD..."
+echo "Scanning merged pull requests between ${SINCE_REF} and ${UPPER_REF}..."
 
 # Set of commits in range, used to decide whether a PR landed in this release.
 declare -A RANGE_SHAS=()
@@ -254,10 +274,10 @@ fi
 
 # ─── Scan release descriptions for CVEs ────────────────────────────────────
 
-echo "Scanning release descriptions between ${SINCE_REF} and HEAD..."
+echo "Scanning release descriptions between ${SINCE_REF} and ${UPPER_REF}..."
 
-# Get all tags reachable from HEAD but not from SINCE_REF (i.e., tags in our range)
-TAGS_IN_RANGE=$(git tag --merged HEAD --no-merged "$SINCE_REF" 2>/dev/null || true)
+# Tags reachable from UPPER_REF but not from SINCE_REF (tags in our range)
+TAGS_IN_RANGE=$(git tag --merged "$UPPER_REF" --no-merged "$SINCE_REF" 2>/dev/null || true)
 
 if [ -n "$TAGS_IN_RANGE" ]; then
   while IFS= read -r tag; do
