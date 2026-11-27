@@ -1,8 +1,10 @@
 #!/bin/bash
 # git-csaf-vex-gen-ci.sh — generate CSAF VEX documents from fork git history
 #
-# Designed for Nordix forks where release tags follow the pattern:
-#   v1.7.3-est-1, camel-3.14.10-est-1, kustomize/v1.24.0-est1
+# Designed for Nordix forks where release tags follow the pattern
+# <upstream tag>-est-<number> (the number is digits only), e.g.:
+#   v1.7.3-est-1, camel-3.14.10-est-1, kustomize/v1.24.0-est-2
+# Tags such as v1.7.3-est or v1.7.3-est1 are NOT valid release tags.
 #
 # The script auto-resolves the upstream base tag from the release tag,
 # fetches it from the upstream repo, and uses it as the scan starting point.
@@ -14,8 +16,9 @@
 #   product-purl:    PURL for the product (default: auto-detected as pkg:generic/<repo-name>@<latest-tag>)
 #
 # Options:
-#   --release-tag TAG      the fork release tag (e.g. v1.7.3-est-1); auto-computes
-#                          base tag by stripping -est[N] suffix and fetches from upstream
+#   --release-tag TAG      the fork release tag, <upstream tag>-est-<number> (e.g. v1.7.3-est-1);
+#                          auto-computes the base tag by stripping -est-<number> and fetches
+#                          it from upstream.
 #   --since-ref REF        tag/commit to scan from (overrides --release-tag auto-detection)
 #   --output-dir DIR       where to write VEX files (default: vex-output)
 #   --upstream-url URL     upstream repo URL for fetching base tags (auto-detected if omitted)
@@ -35,6 +38,8 @@ PER_CVE=false
 
 readonly PUBLISHER_NAME="EST"
 readonly PUBLISHER_NS="https://github.com/Nordix"
+# Release tags: <upstream tag>-est-<number>, digits only (v1.7.3-est-1, not -est or -est1)
+readonly EST_TAG_REGEX='^.+-est-[0-9]+$'
 
 # ─── Parse arguments ────────────────────────────────────────────────────────
 
@@ -66,10 +71,15 @@ command -v jq >/dev/null 2>&1 || { echo "Error: jq not found in PATH" >&2; exit 
 command -v git >/dev/null 2>&1 || { echo "Error: git not found in PATH" >&2; exit 1; }
 command -v gh >/dev/null 2>&1 || { echo "Error: gh not found in PATH" >&2; exit 1; }
 
-if ! git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1; then
-  echo "Error: $REPO_PATH is not a git repository" >&2
+# A supplied release tag must be <upstream tag>-est-<number>. Checked before any
+# GitHub call so a malformed tag fails fast.
+if [ -n "$EST_RELEASE_TAG" ] && ! [[ "$EST_RELEASE_TAG" =~ $EST_TAG_REGEX ]]; then
+  echo "Error: release tag '$EST_RELEASE_TAG' is not valid; expected <upstream tag>-est-<number> (e.g. v1.7.3-est-1)" >&2
   exit 1
 fi
+
+git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1 \
+  || { echo "Error: $REPO_PATH is not a git repository" >&2; exit 1; }
 
 cd "$REPO_PATH"
 
@@ -79,9 +89,9 @@ REPO_SLUG=$(git remote get-url origin | sed 's|.*github\.com[:/]||; s|\.git$||')
 # ─── Auto-detect release tag if not provided ────────────────────────────────
 
 if [ -z "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
-  # Find the latest -est tag in the repo (exclude api/ prefixed Go module tags).
-  # Matches any -est marker regardless of what follows: -est, -est1, -est-1, -est.rc2 ...
-  EST_RELEASE_TAG=$(git tag --sort=-creatordate | grep -v '^api/' | grep -E -- '-est' | head -1 || true)
+  # Find the latest release tag (exclude api/ prefixed Go module tags). Only tags
+  # of the form <upstream tag>-est-<number> qualify; -est and -est1 are ignored.
+  EST_RELEASE_TAG=$(git tag --sort=-creatordate | grep -v '^api/' | grep -E -- "$EST_TAG_REGEX" | head -1 || true)
   if [ -n "$EST_RELEASE_TAG" ]; then
     echo "Auto-detected release tag: $EST_RELEASE_TAG"
   else
@@ -100,10 +110,10 @@ fi
 # ─── Upstream base tag resolution ───────────────────────────────────────────
 
 if [ -n "$EST_RELEASE_TAG" ] && [ -z "$SINCE_REF" ]; then
-  # Strip the -est marker and everything after it, whatever form it takes.
-  # The leading (.*) anchors on the last -est, so tags whose name part
-  # also contains "-est" strip correctly.
-  UPSTREAM_BASE_TAG=$(echo "$EST_RELEASE_TAG" | sed -E 's/(.*)-est.*$/\1/')
+  # Strip the trailing -est-<number>. The tag was validated against EST_TAG_REGEX,
+  # so everything after the last "-est-" is digits and the shortest "-est-*"
+  # suffix is exactly that marker (names containing "-est-" earlier are kept).
+  UPSTREAM_BASE_TAG="${EST_RELEASE_TAG%-est-*}"
   echo "EST release tag: $EST_RELEASE_TAG"
   echo "Computed upstream base tag: $UPSTREAM_BASE_TAG"
 
