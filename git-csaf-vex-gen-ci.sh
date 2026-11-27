@@ -14,6 +14,9 @@
 #   2. merged pull request titles and bodies (GitHub API)
 #   3. GitHub release descriptions for tags in the window (GitHub API)
 #
+# The GitHub-backed scans (2 and 3) FAIL LOUDLY: if GitHub cannot be reached,
+# the token is invalid, or the token lacks pull request read access, the script
+# exits non-zero instead of silently producing an incomplete VEX.
 #
 # Only requires: git, jq, gh, date (coreutils)
 #
@@ -31,6 +34,9 @@
 #   --output-dir DIR       where to write VEX files (default: vex-output)
 #   --upstream-url URL     upstream repo URL for fetching base tags (auto-detected if omitted)
 #   --per-cve              also emit individual per-CVE CSAF VEX files
+#
+# Authentication: gh must be authenticated (GH_TOKEN or `gh auth login`). In
+# GitHub Actions the token needs `contents: read` and `pull-requests: read`.
 
 set -euo pipefail
 
@@ -98,7 +104,28 @@ REPO_SLUG=$(git remote get-url origin | sed 's|.*github\.com[:/]||; s|\.git$||')
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 CVE_ENTRIES_FILE="$WORK_DIR/cve-entries.ndjson"
+PR_TSV="$WORK_DIR/prs.tsv"
+GH_ERR="$WORK_DIR/gh.err"
 : > "$CVE_ENTRIES_FILE"
+
+# ─── GitHub access preflight ────────────────────────────────────────────────
+# The PR and release scans depend on GitHub. Verify access BEFORE scanning so a
+# bad token or missing permission aborts the run instead of silently yielding a
+# VEX built from commit messages only.
+
+if ! gh api "repos/${REPO_SLUG}" --jq '.full_name' >/dev/null 2>"$GH_ERR"; then
+  echo "Error: cannot access GitHub repo ${REPO_SLUG} with gh:" >&2
+  sed 's/^/  /' "$GH_ERR" >&2
+  echo "Error: gh is not authenticated or lacks access; set GH_TOKEN or run 'gh auth login'" >&2
+  exit 1
+fi
+
+if ! gh api "repos/${REPO_SLUG}/pulls?state=closed&per_page=1" >/dev/null 2>"$GH_ERR"; then
+  echo "Error: cannot list pull requests for ${REPO_SLUG}:" >&2
+  sed 's/^/  /' "$GH_ERR" >&2
+  echo "Error: token lacks pull request read access (in Actions add 'pull-requests: read')" >&2
+  exit 1
+fi
 
 # ─── Auto-detect release tag if not provided ────────────────────────────────
 
@@ -260,11 +287,30 @@ echo "Scanning merged pull requests between ${SINCE_REF} and ${UPPER_REF}..."
 declare -A RANGE_SHAS=()
 while IFS= read -r sha; do
   [ -n "$sha" ] && RANGE_SHAS["$sha"]=1
-done < <(git rev-list "$LOG_RANGE" 2>/dev/null || true)
+done < <(git rev-list "$LOG_RANGE")
 
-if [ "${#RANGE_SHAS[@]}" -gt 0 ]; then
-  # Only merged PRs: an open or closed-unmerged PR still exposes a
-  # merge_commit_sha, and treating one as "fixed" would be a false VEX claim.
+if [ "${#RANGE_SHAS[@]}" -eq 0 ]; then
+  echo "Warning: no commits in range $LOG_RANGE; skipping PR scan" >&2
+else
+  # Fetch every closed PR. Any failure aborts: a partial or empty PR list would
+  # silently under-report CVEs.
+  if ! gh api --paginate "repos/${REPO_SLUG}/pulls?state=closed&per_page=100" \
+      --jq '.[]
+            | select(.merged_at != null)
+            | [ (.number|tostring),
+                (.merge_commit_sha // ""),
+                (.title | gsub("[\n\r\t]"; " ")),
+                ((.title + " " + (.body // "")) | gsub("[\n\r\t]"; " ")) ]
+            | @tsv' > "$PR_TSV" 2>"$GH_ERR"; then
+    echo "Error: failed to list pull requests for ${REPO_SLUG}:" >&2
+    sed 's/^/  /' "$GH_ERR" >&2
+    echo "Error: PR scan could not complete; refusing to write an incomplete VEX" >&2
+    exit 1
+  fi
+
+  # Only merged PRs (filtered above): an open or closed-unmerged PR still
+  # exposes a merge_commit_sha, and treating one as "fixed" would be a false
+  # VEX claim.
   while IFS=$'\t' read -r pr_num pr_sha pr_title pr_text; do
     [ -n "${pr_num:-}" ] || continue
     # Skip PRs whose merge commit is not part of this release range
@@ -276,14 +322,7 @@ if [ "${#RANGE_SHAS[@]}" -gt 0 ]; then
         "Fixed via PR #${pr_num} (commit ${pr_sha:0:12}): ${pr_title}" \
         "Update to ${PRODUCT_NAME} ${PRODUCT_VERSION} or later (fork PR #${pr_num}, commit ${pr_sha:0:12})"
     done
-  done < <(gh api --paginate "repos/${REPO_SLUG}/pulls?state=closed&per_page=100" \
-    --jq '.[]
-          | select(.merged_at != null)
-          | [ (.number|tostring),
-              (.merge_commit_sha // ""),
-              (.title | gsub("[\n\r\t]"; " ")),
-              ((.title + " " + (.body // "")) | gsub("[\n\r\t]"; " ")) ]
-          | @tsv' 2>/dev/null || true)
+  done < "$PR_TSV"
 fi
 
 # ─── Scan release descriptions for CVEs ────────────────────────────────────
@@ -291,14 +330,22 @@ fi
 echo "Scanning release descriptions between ${SINCE_REF} and ${UPPER_REF}..."
 
 # Tags reachable from UPPER_REF but not from SINCE_REF (tags in our range)
-TAGS_IN_RANGE=$(git tag --merged "$UPPER_REF" --no-merged "$SINCE_REF" 2>/dev/null || true)
+TAGS_IN_RANGE=$(git tag --merged "$UPPER_REF" --no-merged "$SINCE_REF")
 
 if [ -n "$TAGS_IN_RANGE" ]; then
   while IFS= read -r tag; do
-    release_body=$(gh api "repos/${REPO_SLUG}/releases/tags/${tag}" --jq '.body // empty' 2>/dev/null || true)
-    if [ -z "$release_body" ]; then
+    if release_body=$(gh api "repos/${REPO_SLUG}/releases/tags/${tag}" --jq '.body // empty' 2>"$GH_ERR"); then
+      :
+    elif grep -qiE 'HTTP 404|Not Found' "$GH_ERR"; then
+      # A tag without a GitHub release is normal; nothing to scan.
       continue
+    else
+      echo "Error: failed to read release for tag ${tag}:" >&2
+      sed 's/^/  /' "$GH_ERR" >&2
+      echo "Error: release scan could not complete; refusing to write an incomplete VEX" >&2
+      exit 1
     fi
+    [ -n "$release_body" ] || continue
 
     release_cves=$(echo "$release_body" | grep -oE 'CVE-[0-9]{4}-[0-9]{4,}' || true)
     for cve in $release_cves; do
