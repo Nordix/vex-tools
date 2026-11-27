@@ -210,7 +210,16 @@ record_cve() {
 # exactly what shipped in that release rather than whatever HEAD points to.
 # Falls back to HEAD only when scanning from a bare --since-ref with no tag.
 UPPER_REF="${EST_RELEASE_TAG:-HEAD}"
-LOG_RANGE="${SINCE_REF}^..${UPPER_REF}"
+
+# Normally we scan SINCE_REF^..UPPER_REF so the SINCE_REF commit itself is
+# included. If SINCE_REF is a root commit it has no parent, so "SINCE_REF^" is
+# invalid and would abort the script under `set -e`. Fall back to the full
+# UPPER_REF history in that case (which still includes the root commit).
+if git rev-parse --verify --quiet "${SINCE_REF}^" >/dev/null 2>&1; then
+  LOG_RANGE="${SINCE_REF}^..${UPPER_REF}"
+else
+  LOG_RANGE="$UPPER_REF"
+fi
 
 # ─── Scan commit messages for CVEs ─────────────────────────────────────────
 
